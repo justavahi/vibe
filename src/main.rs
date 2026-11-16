@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod session;
 
 #[tokio::main]
 async fn main() {

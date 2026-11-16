@@ -43,7 +43,7 @@ others) behind a single, OpenAI-compatible API.
 - **Auth:** a bearer token in the `Authorization` header — your OpenRouter API key
 - **Endpoints used:**
   - `GET /models` — list available models (used by `vibe model`)
-  - `POST /chat/completions` — send a chat request (used by `vibe chat`)
+  - `POST /chat/completions` — send a chat request (used by `vibe code`)
 
 ### Getting an API key
 
@@ -57,6 +57,9 @@ others) behind a single, OpenAI-compatible API.
 
 Some models are free; others are billed per token against your OpenRouter
 credits. The model list shown by `vibe model` includes each model's pricing.
+
+> **Tip:** avoid batch-only variants (model IDs ending in `:batch`). They cannot
+> be used with the chat endpoint and will return an error.
 
 ### Configuration
 
@@ -83,7 +86,9 @@ vibe <COMMAND> [ARGS]
 | `vibe help`          | Show the help menu (`-h` and `--help` also work)               |
 | `vibe api-key "<KEY>"` | Save your OpenRouter API key to the config file              |
 | `vibe model`         | Fetch the available models and pick one interactively          |
-| `vibe chat`          | Start an interactive chat with the selected model              |
+| `vibe code`          | Chat with the selected model, keeping session history          |
+| `vibe code <name>`   | Continue a specific session (also `vibe code session <name>`)  |
+| `vibe session <SUB>` | Manage sessions (see [Sessions](#sessions))                    |
 
 ### Examples
 
@@ -94,11 +99,11 @@ vibe api-key "sk-or-v1-..."
 # Choose a model from a live, searchable list
 vibe model
 
-# Start chatting
-vibe chat
+# Start chatting (creates/continues a session for this directory)
+vibe code
 ```
 
-Inside `vibe chat`, type a message and press Enter. Type `exit` (or `quit`), or
+Inside `vibe code`, type a message and press Enter. Type `exit` (or `quit`), or
 press `Ctrl-D`, to leave.
 
 ### Typical first run
@@ -106,5 +111,108 @@ press `Ctrl-D`, to leave.
 ```sh
 vibe api-key "sk-or-v1-..."
 vibe model
-vibe chat
+vibe code
+```
+
+## Sessions
+
+Every directory keeps its own conversations. On the first `vibe code` run in a
+directory, vibe creates a default session named `session` and uses it
+automatically. Once a directory has **two or more** sessions, `vibe code` shows a
+picker (the same UI as `vibe model`) so you can choose which one to continue.
+
+To skip the picker and go straight to a saved session, pass its name:
+
+```sh
+vibe code notes            # continue the session named "notes"
+vibe code session notes    # same thing, explicit form
+```
+
+If the named session does not exist, vibe tells you and suggests
+`vibe session add <name>`.
+
+Each session stores its full message history and metadata, which is replayed to
+the model as context on every turn. Every session also gets a random 8-character
+nickname when it is created; `vibe session list` shows it next to the name.
+
+### Storage layout
+
+Sessions are written in two places at once.
+
+**Locally**, in the directory you run vibe from:
+
+```
+.vibe/
+  sessions/
+    session/
+      files/
+        history.json
+        meta.json
+    notes/
+      files/
+        history.json
+        meta.json
+```
+
+**Globally**, mirrored under your home directory:
+
+```
+~/.vibe/
+  dirs/
+    <dir-name>/
+      sessions/
+        session/
+          files/
+            history.json
+            meta.json
+  trash/
+    <dir-name>/
+      sessions/        # sessions removed with `vibe session remove`
+```
+
+`<dir-name>` is the directory's full path with `$HOME` replaced by `~` and every
+`/` replaced by `-`. For example `/home/you/a/b` becomes `~-a-b`.
+
+`meta.json` holds the session's random 8-character nickname, creation and
+last-used timestamps, and the model that was active when it was created.
+
+Both `.vibe/` (in the working directory) and `~/.vibe/` are created
+automatically when needed. `.vibe/` is listed in `.gitignore` so local session
+data is never committed.
+
+### Managing sessions
+
+```
+vibe session <SUBCOMMAND> [ARGS]
+```
+
+| Subcommand                    | Description                                                     |
+| ----------------------------- | --------------------------------------------------------------- |
+| `add <name>`                  | Create a new session (a random 8-char name is used if omitted)  |
+| `list`                        | List sessions for the current directory                         |
+| `rename, rn <old> <new>`      | Rename a session (local and global)                             |
+| `remove, rm <name>`           | Remove locally; move the global copy to `~/.vibe/trash`         |
+| `delete, del <name>`          | Delete completely, from both `.vibe` and `~/.vibe`              |
+| `clean`                       | Empty this directory's trash                                    |
+| `help`                        | Show session subcommand help                                    |
+
+`list` prints each session's name together with its random nickname:
+
+```
+Sessions in ~-a-b:
+  notes  (k5o0328s)
+  session  (zla85706)
+```
+
+Session names must be unique within a directory and cannot contain `/`, `\`, or
+be `.` / `..`.
+
+```sh
+vibe session add notes          # create a session named "notes"
+vibe session add                # create one with a random name
+vibe session list               # see sessions for this directory
+vibe session rn notes ideas     # rename "notes" to "ideas"
+vibe session rm ideas           # remove locally, keep a copy in trash
+vibe session clean              # empty the trash for this directory
+vibe session del ideas          # delete everywhere
 ```
