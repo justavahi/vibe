@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod provider;
 mod session;
 
 #[tokio::main]

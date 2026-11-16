@@ -3,12 +3,10 @@ use std::future::Future;
 use std::io::{self, Write};
 use std::pin::Pin;
 
-use dialoguer::{Select, theme::ColorfulTheme};
-use openrouter::OpenRouter;
-use openrouter::completions::Request;
-use openrouter::completions::request::{Content, Message};
+use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 
-use crate::config::Config;
+use crate::config::{Config, Vendor};
+use crate::provider::Provider;
 use crate::session::{DEFAULT_SESSION, HistoryEntry, Store};
 
 /// A command handler. It receives the arguments that follow the command name
@@ -23,92 +21,175 @@ where
     Box::pin(fut)
 }
 
-/// Formats an OpenRouter error with the underlying code/message, which the
-/// library's `Display` impl otherwise hides.
-fn describe_error(error: &openrouter::Error) -> String {
-    match error {
-        openrouter::Error::OpenRouter(e) => {
-            format!("OpenRouter error {}: {}", e.code, e.message)
-        }
-        other => other.to_string(),
-    }
-}
-
 /// Prints the help menu.
 pub async fn help(_args: &[String]) {
     println!(
-        r#"vibe - a tiny OpenRouter CLI
+        r#"vibe - a tiny CLI harness for LLM providers
 
 USAGE:
     vibe <COMMAND> [ARGS]
 
 COMMANDS:
-    help              Show this help menu
-    api-key "<KEY>"   Save your OpenRouter API key to the config file
-    model             Pick a model interactively and save it to the config file
-    code              Chat with the selected model, keeping session history
-    code <name>       Continue a specific session (also: code session <name>)
+    help                    Show this help menu
+    vendor [<VENDOR>]       Select the provider (openrouter or venice; default openrouter)
+    api-key "<KEY>"         Save a key for the selected provider
+    api-key -o "<KEY>"      Save an OpenRouter API key
+    api-key -v "<KEY>"      Save a Venice API key
+    model                   Pick a model from the selected provider
+    code                    Chat with the selected model, keeping session history
+    code <name>             Continue a specific session (also: code session <name>)
 
     vibe session - manage sessions for the current directory
       vibe session add <name>             - create a new session (random name if omitted)
+      vibe session new <name>             - create a new session and switch to it
       vibe session list                   - list sessions for the current directory
+      vibe session switch, sw <name>      - switch to a session
       vibe session rename, rn <old> <new> - rename a session
-      vibe session remove, rm <name>      - remove locally, move global copy to trash
-      vibe session delete, del <name>     - delete completely (local and global)
+      vibe session remove, rm <name>...   - remove locally, move global copies to trash
+      vibe session delete, del <name>...  - delete completely (local and global)
       vibe session clean                  - empty this directory's trash
 
 EXAMPLES:
-    vibe api-key "sk-or-v1-..."
+    vibe vendor venice
+    vibe api-key -o "sk-or-v1-..."
     vibe model
     vibe code
-    vibe code session
-    vibe code notes
     vibe session list
 
 Configuration is stored in ~/.config/vibe/config.toml"#
     );
 }
 
-/// Handles `vibe api-key "<key>"`.
+/// Handles `vibe api-key [-o|--openrouter|-v|--venice] "<key>"`.
 pub async fn set_api_key(args: &[String]) {
-    let Some(key) = args.first() else {
-        eprintln!("error: `vibe api-key` requires a key, e.g. vibe api-key \"sk-or-v1-...\"");
-        std::process::exit(1);
+    let mut vendor_flag = None;
+    let mut key = None;
+
+    for arg in args {
+        match arg.as_str() {
+            "-o" | "--openrouter" => vendor_flag = Some(Vendor::OpenRouter),
+            "-v" | "--venice" => vendor_flag = Some(Vendor::Venice),
+            other => key = Some(other.to_string()),
+        }
+    }
+
+    let Some(key) = key else {
+        exit_with("usage: vibe api-key [-o|--openrouter|-v|--venice] \"<key>\"");
     };
 
+    if key == "choose" {
+        exit_with("`vibe api-key choose` was removed. Use `vibe vendor <vendor>` instead.");
+    }
+
     if key.trim().is_empty() {
-        eprintln!("error: API key cannot be empty");
-        std::process::exit(1);
+        exit_with("API key cannot be empty");
     }
 
     let mut config = Config::load().unwrap_or_else(|e| exit_with(e));
-    config.api_key = Some(key.trim().to_string());
 
+    let vendor = match vendor_flag {
+        Some(vendor) => vendor,
+        None => {
+            // No flag: use the stored vendor, defaulting to (and persisting)
+            // openrouter when the field is missing or invalid.
+            let vendor = config.vendor();
+            if !config.has_valid_vendor() {
+                config.set_vendor(Vendor::OpenRouter);
+            }
+            vendor
+        }
+    };
+
+    config.set_api_key_for(vendor, &key);
     config.save().unwrap_or_else(|e| exit_with(e));
-    println!("API key saved to {}", Config::path().display());
+
+    println!("{vendor} API key saved to {}", Config::path().display());
 }
 
-/// Handles `vibe model`: fetches the available models and lets the user pick one.
+/// Handles `vibe vendor [<vendor>]`: select the active provider.
+///
+/// With no argument the vendor defaults to `openrouter`. Afterwards, if the
+/// configured model is not offered by the new vendor, the user is offered a
+/// chance to pick a new one.
+pub async fn set_vendor(args: &[String]) {
+    let name = args.first().map(String::as_str).unwrap_or("openrouter");
+
+    let Some(vendor) = Vendor::parse(name) else {
+        let options = Vendor::ALL
+            .iter()
+            .map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" or ");
+        exit_with(format!("unknown vendor `{name}`. Use `{options}`."));
+    };
+
+    let mut config = Config::load().unwrap_or_else(|e| exit_with(e));
+    config.set_vendor(vendor);
+    config.save().unwrap_or_else(|e| exit_with(e));
+
+    println!("Provider set to {vendor}");
+
+    // Verify the current model is available from the new vendor.
+    let Some(model) = config.llm.model.clone() else {
+        return;
+    };
+
+    let Some(api_key) = config.api_key_for(vendor) else {
+        println!("note: no {vendor} API key set; skipping model check");
+        return;
+    };
+
+    let provider = Provider::new(vendor, api_key);
+    let Ok(models) = provider.models().await else {
+        // Can't reach the provider; skip the check silently.
+        return;
+    };
+
+    if models.iter().any(|m| m.id == model) {
+        return;
+    }
+
+    let switch = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!(
+            "Current model `{model}` does not exist in {vendor}. Would you like to switch your model?"
+        ))
+        .default(false)
+        .interact()
+        .unwrap_or_else(|e| exit_with(format!("selection failed: {e}")));
+
+    if switch {
+        pick_model(&[]).await;
+    }
+}
+
+/// Handles `vibe model`: fetches models from the selected provider and lets
+/// the user pick one.
 pub async fn pick_model(_args: &[String]) {
     let config = Config::load().unwrap_or_else(|e| exit_with(e));
+    let vendor = config.vendor();
     let api_key = config.require_api_key().unwrap_or_else(|e| exit_with(e));
 
-    println!("Fetching models from OpenRouter...");
-    let client = OpenRouter::new(api_key);
+    println!("Fetching models from {vendor}...");
+    let provider = Provider::new(vendor, api_key);
 
-    let mut models = client
-        .models(&[])
+    let models = provider
+        .models()
         .await
         .unwrap_or_else(|e| exit_with(format!("failed to fetch models: {e}")));
 
     if models.is_empty() {
-        exit_with("OpenRouter returned no models");
+        exit_with(format!("{vendor} returned no models"));
     }
 
-    models.sort_by(|a, b| a.id.cmp(&b.id));
     let labels: Vec<String> = models
         .iter()
-        .map(|m| format!("{}  -  {}", m.id, m.name))
+        .map(|m| {
+            if m.name.is_empty() || m.name == m.id {
+                m.id.clone()
+            } else {
+                format!("{}  -  {}", m.id, m.name)
+            }
+        })
         .collect();
 
     let selection = Select::with_theme(&ColorfulTheme::default())
@@ -121,7 +202,7 @@ pub async fn pick_model(_args: &[String]) {
     let chosen = models[selection].id.clone();
 
     let mut config = Config::load().unwrap_or_else(|e| exit_with(e));
-    config.model = Some(chosen.clone());
+    config.llm.model = Some(chosen.clone());
     config.save().unwrap_or_else(|e| exit_with(e));
 
     println!("Model set to {chosen}");
@@ -154,23 +235,30 @@ pub async fn code(args: &[String]) {
             }
             name
         }
-        None => match sessions.as_slice() {
-            [] => {
-                store
-                    .ensure_session(DEFAULT_SESSION, Some(model))
-                    .unwrap_or_else(|e| exit_with(e));
-                DEFAULT_SESSION.to_string()
-            }
-            [only] => only.clone(),
-            _ => pick_session(&sessions),
+        None => match store.current().filter(|c| store.exists(c)) {
+            // Respect a session chosen with `vibe session switch` (or the last one used).
+            Some(current) => current,
+            None => match sessions.as_slice() {
+                [] => {
+                    store
+                        .ensure_session(DEFAULT_SESSION, Some(model))
+                        .unwrap_or_else(|e| exit_with(e));
+                    DEFAULT_SESSION.to_string()
+                }
+                [only] => only.clone(),
+                _ => pick_session(&sessions),
+            },
         },
     };
 
+    store.set_current(&session).unwrap_or_else(|e| exit_with(e));
+
     let mut history = store.load_history(&session).unwrap_or_else(|e| exit_with(e));
 
-    let client = OpenRouter::new(api_key);
+    let vendor = config.vendor();
+    let provider = Provider::new(vendor, api_key);
     println!(
-        "Session `{session}` in {}. Chatting with {model}. Type 'exit' / Ctrl-D to quit.\n",
+        "Session `{session}` in {}. Chatting with {model} via {vendor}. Type 'exit' / Ctrl-D to quit.\n",
         store.dir_name
     );
 
@@ -203,26 +291,16 @@ pub async fn code(args: &[String]) {
             break;
         }
 
-        let request = Request {
-            model: Some(model.to_string()),
-            messages: Some(build_messages(&history, prompt)),
-            ..Request::default()
-        };
+        // Append the user's turn, then send the whole conversation.
+        history.push(HistoryEntry {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        });
 
-        match client.chat_completion(request).await {
-            Ok(response) => {
-                let answer = response
-                    .choices
-                    .first()
-                    .and_then(extract_text)
-                    .unwrap_or_else(|| "<empty response>".to_string());
-
+        match provider.chat(model, &history).await {
+            Ok(answer) => {
                 println!("vibe> {answer}\n");
 
-                history.push(HistoryEntry {
-                    role: "user".to_string(),
-                    content: prompt.to_string(),
-                });
                 history.push(HistoryEntry {
                     role: "assistant".to_string(),
                     content: answer,
@@ -233,41 +311,14 @@ pub async fn code(args: &[String]) {
                     .unwrap_or_else(|e| exit_with(e));
             }
             Err(e) => {
-                eprintln!("error: request failed: {}\n", describe_error(&e));
+                eprintln!("error: request failed: {e}\n");
+                // Drop the unanswered turn so history stays consistent.
+                history.pop();
             }
         }
     }
 
     println!("bye!");
-}
-
-/// Turns stored history plus a new prompt into the messages to send.
-fn build_messages(history: &[HistoryEntry], prompt: &str) -> Vec<Message> {
-    let mut messages = Vec::with_capacity(history.len() + 1);
-
-    for entry in history {
-        match entry.role.as_str() {
-            "user" => messages.push(Message::User {
-                content: Content::Plain(entry.content.clone()),
-                name: None,
-                cache_control: None,
-            }),
-            "assistant" => messages.push(Message::Assistant {
-                content: Some(Content::Plain(entry.content.clone())),
-                name: None,
-                tool_calls: None,
-            }),
-            _ => {}
-        }
-    }
-
-    messages.push(Message::User {
-        content: Content::Plain(prompt.to_string()),
-        name: None,
-        cache_control: None,
-    });
-
-    messages
 }
 
 /// Parses the optional session selector from `vibe code [session] <name>`.
@@ -292,17 +343,6 @@ fn pick_session(sessions: &[String]) -> String {
         .unwrap_or_else(|e| exit_with(format!("selection failed: {e}")));
 
     sessions[selection].clone()
-}
-
-/// Pulls the assistant text out of a completion choice.
-fn extract_text(choice: &openrouter::completions::response::Choice) -> Option<String> {
-    use openrouter::completions::response::Choice;
-
-    match choice {
-        Choice::NonStreaming(c) => c.message.content.clone(),
-        Choice::NonChat(c) => Some(c.text.clone()),
-        Choice::Streaming(c) => c.delta.content.clone(),
-    }
 }
 
 // --- session subcommands ---------------------------------------------------
@@ -336,10 +376,12 @@ USAGE:
 
 SUBCOMMANDS:
     add <name>                  Create a new session (random name if omitted)
+    new <name>                  Create a new session and switch to it
     list                        List sessions for the current directory
+    switch, sw <name>           Switch to a session
     rename, rn <old> <new>      Rename a session
-    remove, rm <name>           Remove locally, move global copy to trash
-    delete, del <name>          Delete completely (local and global)
+    remove, rm <name>...        Remove locally, move global copies to trash
+    delete, del <name>...       Delete completely (local and global)
     clean                       Empty this directory's trash
 
 Sessions are stored in ./.vibe/sessions and mirrored to
@@ -347,8 +389,8 @@ Sessions are stored in ./.vibe/sessions and mirrored to
     );
 }
 
-/// `vibe session add [name]`.
-async fn session_add(args: &[String]) {
+/// Creates a session from `[name]` (random if omitted) and returns its name.
+fn create_session(args: &[String]) -> String {
     let store = Store::new().unwrap_or_else(|e| exit_with(e));
     store.ensure().unwrap_or_else(|e| exit_with(e));
 
@@ -357,12 +399,28 @@ async fn session_add(args: &[String]) {
         None => crate::session::random_nickname(),
     };
 
-    let model = Config::load().ok().and_then(|c| c.model);
+    let model = Config::load().ok().and_then(|c| c.llm.model);
     store
         .create(&name, model.as_deref())
         .unwrap_or_else(|e| exit_with(e));
 
+    name
+}
+
+/// `vibe session add [name]`.
+async fn session_add(args: &[String]) {
+    let name = create_session(args);
     println!("Session `{name}` created");
+}
+
+/// `vibe session new [name]`: like `add`, then switches to the new session.
+async fn session_new(args: &[String]) {
+    let name = create_session(args);
+
+    let store = Store::new().unwrap_or_else(|e| exit_with(e));
+    store.set_current(&name).unwrap_or_else(|e| exit_with(e));
+
+    println!("Session `{name}` created and switched to");
 }
 
 /// `vibe session list`.
@@ -376,9 +434,15 @@ async fn session_list(_args: &[String]) {
     }
 
     println!("Sessions in {}:", store.dir_name);
+    let current = store.current();
     for name in sessions {
         let meta = store.read_meta(&name).unwrap_or_default();
-        println!("  {name}  ({})", meta.nickname);
+        let marker = if current.as_deref() == Some(name.as_str()) {
+            " (current)"
+        } else {
+            ""
+        };
+        println!("  {name}  ({}){marker}", meta.nickname);
     }
 }
 
@@ -394,28 +458,52 @@ async fn session_rename(args: &[String]) {
     println!("Session `{old}` renamed to `{new}`");
 }
 
-/// `vibe session remove <name>`.
+/// `vibe session remove <name>...`.
 async fn session_remove(args: &[String]) {
-    let Some(name) = args.first() else {
-        exit_with("usage: vibe session remove <name>");
-    };
+    if args.is_empty() {
+        exit_with("usage: vibe session remove <name>...");
+    }
 
     let store = Store::new().unwrap_or_else(|e| exit_with(e));
-    store.remove(name).unwrap_or_else(|e| exit_with(e));
+    let mut failed = false;
 
-    println!("Session `{name}` removed (global copy moved to trash)");
+    for name in args {
+        match store.remove(name) {
+            Ok(()) => println!("Session `{name}` removed (global copy moved to trash)"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                failed = true;
+            }
+        }
+    }
+
+    if failed {
+        std::process::exit(1);
+    }
 }
 
-/// `vibe session delete <name>`.
+/// `vibe session delete <name>...`.
 async fn session_delete(args: &[String]) {
-    let Some(name) = args.first() else {
-        exit_with("usage: vibe session delete <name>");
-    };
+    if args.is_empty() {
+        exit_with("usage: vibe session delete <name>...");
+    }
 
     let store = Store::new().unwrap_or_else(|e| exit_with(e));
-    store.delete(name).unwrap_or_else(|e| exit_with(e));
+    let mut failed = false;
 
-    println!("Session `{name}` deleted");
+    for name in args {
+        match store.delete(name) {
+            Ok(()) => println!("Session `{name}` deleted"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                failed = true;
+            }
+        }
+    }
+
+    if failed {
+        std::process::exit(1);
+    }
 }
 
 /// `vibe session clean`.
@@ -424,6 +512,24 @@ async fn session_clean(_args: &[String]) {
     store.clean().unwrap_or_else(|e| exit_with(e));
 
     println!("Trash cleaned for {}", store.dir_name);
+}
+
+/// `vibe session switch <name>`.
+async fn session_switch(args: &[String]) {
+    let Some(name) = args.first() else {
+        exit_with("usage: vibe session switch <name>");
+    };
+
+    let store = Store::new().unwrap_or_else(|e| exit_with(e));
+
+    if !store.exists(name) {
+        exit_with(format!(
+            "session `{name}` not found. Create it with `vibe session add {name}`"
+        ));
+    }
+
+    store.set_current(name).unwrap_or_else(|e| exit_with(e));
+    println!("Switched to session `{name}`");
 }
 
 /// Prints an error and exits with a non-zero status.
@@ -440,6 +546,9 @@ pub fn registry() -> HashMap<&'static str, Handler> {
     fn wrap_api_key(args: &[String]) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         boxed(set_api_key(args))
     }
+    fn wrap_vendor(args: &[String]) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        boxed(set_vendor(args))
+    }
     fn wrap_model(args: &[String]) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         boxed(pick_model(args))
     }
@@ -455,6 +564,7 @@ pub fn registry() -> HashMap<&'static str, Handler> {
         ("-h", wrap_help as Handler),
         ("--help", wrap_help as Handler),
         ("api-key", wrap_api_key as Handler),
+        ("vendor", wrap_vendor as Handler),
         ("model", wrap_model as Handler),
         ("code", wrap_code as Handler),
         ("session", wrap_session as Handler),
@@ -465,6 +575,9 @@ pub fn registry() -> HashMap<&'static str, Handler> {
 pub fn session_registry() -> HashMap<&'static str, Handler> {
     fn wrap_add(args: &[String]) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         boxed(session_add(args))
+    }
+    fn wrap_new(args: &[String]) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        boxed(session_new(args))
     }
     fn wrap_list(args: &[String]) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         boxed(session_list(args))
@@ -481,12 +594,16 @@ pub fn session_registry() -> HashMap<&'static str, Handler> {
     fn wrap_clean(args: &[String]) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         boxed(session_clean(args))
     }
+    fn wrap_switch(args: &[String]) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        boxed(session_switch(args))
+    }
     fn wrap_help(args: &[String]) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         boxed(session_help_cmd(args))
     }
 
     HashMap::from([
         ("add", wrap_add as Handler),
+        ("new", wrap_new as Handler),
         ("list", wrap_list as Handler),
         ("rename", wrap_rename as Handler),
         ("rn", wrap_rename as Handler),
@@ -495,6 +612,8 @@ pub fn session_registry() -> HashMap<&'static str, Handler> {
         ("delete", wrap_delete as Handler),
         ("del", wrap_delete as Handler),
         ("clean", wrap_clean as Handler),
+        ("switch", wrap_switch as Handler),
+        ("sw", wrap_switch as Handler),
         ("help", wrap_help as Handler),
     ])
 }

@@ -48,6 +48,7 @@ pub struct Meta {
 pub struct Store {
     /// The sanitized directory name used under `~/.vibe/dirs` and `~/.vibe/trash`.
     pub dir_name: String,
+    local_root: PathBuf,
     local_sessions: PathBuf,
     global_sessions: PathBuf,
     trash_sessions: PathBuf,
@@ -59,16 +60,39 @@ impl Store {
         let cwd = env::current_dir()?;
         let dir_name = sanitize_dir_name(&cwd);
 
-        let local_sessions = cwd.join(".vibe").join("sessions");
+        let local_root = cwd.join(".vibe");
+        let local_sessions = local_root.join("sessions");
         let global_sessions = vibe_home().join("dirs").join(&dir_name).join("sessions");
         let trash_sessions = vibe_home().join("trash").join(&dir_name).join("sessions");
 
         Ok(Self {
             dir_name,
+            local_root,
             local_sessions,
             global_sessions,
             trash_sessions,
         })
+    }
+
+    /// Records which session is currently active for this directory.
+    pub fn set_current(&self, name: &str) -> io::Result<()> {
+        fs::create_dir_all(&self.local_root)?;
+        fs::write(self.local_root.join("current"), name)
+    }
+
+    /// Returns the currently active session for this directory, if any.
+    pub fn current(&self) -> Option<String> {
+        fs::read_to_string(self.local_root.join("current"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Clears the current-session pointer if it refers to `name`.
+    fn clear_current_if(&self, name: &str) {
+        if self.current().as_deref() == Some(name) {
+            let _ = fs::remove_file(self.local_root.join("current"));
+        }
     }
 
     /// Creates the local and global session directories if missing.
@@ -162,6 +186,11 @@ impl Store {
             fs::rename(self.global_session(old), self.global_session(new))?;
         }
 
+        // Keep the current-session pointer valid across the rename.
+        if self.current().as_deref() == Some(old) {
+            self.set_current(new)?;
+        }
+
         Ok(())
     }
 
@@ -187,6 +216,7 @@ impl Store {
             fs::rename(&global, &dest)?;
         }
 
+        self.clear_current_if(name);
         Ok(())
     }
 
@@ -214,6 +244,7 @@ impl Store {
             fs::remove_dir_all(&global)?;
         }
 
+        self.clear_current_if(name);
         Ok(())
     }
 
