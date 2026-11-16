@@ -27,6 +27,3 @@ rustc-ice-*.txt
 # Added by cargo
 
 /target
-
-# Local config containing the OpenRouter API key
-vibe.toml

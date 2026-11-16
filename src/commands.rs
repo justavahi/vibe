@@ -35,8 +35,8 @@ USAGE:
 
 COMMANDS:
     help              Show this help menu
-    api-key "<KEY>"   Save your OpenRouter API key to vibe.toml
-    model             Pick a model interactively and save it to vibe.toml
+    api-key "<KEY>"   Save your OpenRouter API key to the config file
+    model             Pick a model interactively and save it to the config file
     chat              Start an interactive chat with the selected model
 
 EXAMPLES:
@@ -44,7 +44,7 @@ EXAMPLES:
     vibe model
     vibe chat
 
-Configuration is stored locally in ./vibe.toml"#
+Configuration is stored in ~/.config/vibe/config.toml"#
     );
 }
 

@@ -3,6 +3,18 @@ mod config;
 
 #[tokio::main]
 async fn main() {
+    // Make sure the config directory (~/.config/vibe) exists before any command runs.
+    let config_dir = config::Config::dir();
+    if !config_dir.exists() {
+        if let Err(e) = config::Config::ensure_dir() {
+            eprintln!(
+                "error: could not create config directory {}: {e}",
+                config_dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Command registry: name -> handler. Handlers receive the args after the command.
     let commands = commands::registry();
 

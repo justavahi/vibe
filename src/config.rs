@@ -1,13 +1,14 @@
+use std::env;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Name of the local config file, kept next to wherever `vibe` is run from.
-pub const CONFIG_FILE: &str = "vibe.toml";
+/// Name of the config file inside the config directory.
+pub const CONFIG_FILE: &str = "config.toml";
 
-/// The on-disk configuration, stored locally as `vibe.toml`.
+/// The on-disk configuration, stored in `~/.config/vibe/config.toml`.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     /// OpenRouter API key.
@@ -20,13 +21,31 @@ pub struct Config {
 }
 
 impl Config {
-    /// Path to the config file in the current working directory.
-    pub fn path() -> PathBuf {
-        Path::new(CONFIG_FILE).to_path_buf()
+    /// The config directory: `~/.config/vibe`.
+    ///
+    /// Respects `XDG_CONFIG_HOME` when set, otherwise falls back to
+    /// `$HOME/.config`.
+    pub fn dir() -> PathBuf {
+        let base = env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+            .unwrap_or_else(|| PathBuf::from(".config"));
+
+        base.join("vibe")
     }
 
-    /// Loads the config from `vibe.toml`, or returns an empty config if it
-    /// does not exist yet.
+    /// Creates the config directory (`~/.config/vibe`) if it does not exist yet.
+    pub fn ensure_dir() -> io::Result<()> {
+        fs::create_dir_all(Self::dir())
+    }
+
+    /// Path to the config file: `~/.config/vibe/config.toml`.
+    pub fn path() -> PathBuf {
+        Self::dir().join(CONFIG_FILE)
+    }
+
+    /// Loads the config, or returns an empty config if it does not exist yet.
     pub fn load() -> io::Result<Self> {
         let path = Self::path();
 
@@ -44,7 +63,7 @@ impl Config {
         })
     }
 
-    /// Writes the config back to `vibe.toml`.
+    /// Writes the config back to `~/.config/vibe/config.toml`.
     pub fn save(&self) -> io::Result<()> {
         let path = Self::path();
 

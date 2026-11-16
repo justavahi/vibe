@@ -2,8 +2,7 @@
 
 A tiny, local-first CLI harness for chatting with large language models through
 the [OpenRouter](https://openrouter.ai) API. Pick a model once, save your API
-key, and chat — configuration lives in a plain `vibe.toml` next to where you run
-it.
+key, and chat — configuration lives in `~/.config/vibe/config.toml`.
 
 ## Installation
 
@@ -61,15 +60,17 @@ credits. The model list shown by `vibe model` includes each model's pricing.
 
 ### Configuration
 
-Settings are stored locally in `vibe.toml` in the current working directory:
+Settings are stored in `~/.config/vibe/config.toml`:
 
 ```toml
 api_key = "sk-or-v1-..."
 model = "openai/gpt-4o-mini"
 ```
 
-`vibe.toml` holds a secret and is listed in `.gitignore`. Both keys are written
-by the commands below — you normally don't edit the file by hand.
+The directory is created automatically on first run. If `XDG_CONFIG_HOME` is
+set, the file lives at `$XDG_CONFIG_HOME/vibe/config.toml` instead. The file
+holds a secret, so keep it private. Both keys are written by the commands below —
+you normally don't edit it by hand.
 
 ## Commands
 
@@ -80,7 +81,7 @@ vibe <COMMAND> [ARGS]
 | Command              | Description                                                    |
 | -------------------- | -------------------------------------------------------------- |
 | `vibe help`          | Show the help menu (`-h` and `--help` also work)               |
-| `vibe api-key "<KEY>"` | Save your OpenRouter API key to `vibe.toml`                  |
+| `vibe api-key "<KEY>"` | Save your OpenRouter API key to the config file              |
 | `vibe model`         | Fetch the available models and pick one interactively          |
 | `vibe chat`          | Start an interactive chat with the selected model              |
 
